@@ -1,0 +1,160 @@
+# pipelines/templates/docker/sbom-syft.yml
+parameters:
+  # Path to source directory to scan (relative to repo root)
+  - name: sourcePath
+    type: string
+    default: "backend"
+
+  # space-separated formats, e.g. "spdx-json cyclonedx-json"
+  - name: outputFormats
+    type: string
+    default: "spdx-json cyclonedx-json"
+
+  # Kept for compatibility with callers (no-op for source SBOM)
+  - name: attachToImage
+    type: boolean
+    default: false
+
+  # Unique by default to avoid "Artifact sbom already exists"
+  - name: artifactName
+    type: string
+    default: "sbom-src-$(System.StageName)-$(System.JobName)"
+
+steps:
+  - script: |
+      set -euo pipefail
+
+      echo "SBOM_SYFT_TEMPLATE_VERSION=20260212_SOURCE_v2"
+      echo "== Syft availability check =="
+
+      WORK_BIN_DIR="$(Pipeline.Workspace)/bin"
+      mkdir -p "$WORK_BIN_DIR"
+      WORK_SYFT="$WORK_BIN_DIR/syft"
+      SYS_SYFT="/usr/local/bin/syft"
+
+      have_syft() {
+        command -v syft >/dev/null 2>&1 || [ -x "$SYS_SYFT" ] || [ -x "$WORK_SYFT" ]
+      }
+
+      if have_syft; then
+        echo "Syft already available."
+        if [ -x "$SYS_SYFT" ]; then
+          echo "syft at: $SYS_SYFT"
+          "$SYS_SYFT" version || true
+        elif [ -x "$WORK_SYFT" ]; then
+          echo "syft at: $WORK_SYFT"
+          "$WORK_SYFT" version || true
+        else
+          echo "syft in PATH: $(command -v syft)"
+          syft version || true
+        fi
+        exit 0
+      fi
+
+      echo "Syft not found. Installing..."
+
+      # Prefer system-wide install if passwordless sudo is available
+      if sudo -n true 2>/dev/null; then
+        echo "Passwordless sudo detected. Installing syft to $SYS_SYFT ..."
+        TMP_DIR="$(mktemp -d)"
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b "$TMP_DIR"
+        sudo mv "$TMP_DIR/syft" "$SYS_SYFT"
+        sudo chmod +x "$SYS_SYFT"
+        rm -rf "$TMP_DIR"
+
+        echo "Syft installed at: $SYS_SYFT"
+        "$SYS_SYFT" version
+      else
+        echo "No passwordless sudo. Installing syft to workspace: $WORK_SYFT (no sudo)..."
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b "$WORK_BIN_DIR"
+
+        echo "Syft installed at: $WORK_SYFT"
+        "$WORK_SYFT" version
+      fi
+
+      # Prepend workspace bin for later steps (nice-to-have)
+      echo "##vso[task.prependpath]$WORK_BIN_DIR"
+
+      echo "== Syft install complete =="
+      echo "System syft exists? $( [ -x "$SYS_SYFT" ] && echo yes || echo no )"
+      echo "Workspace syft exists? $( [ -x "$WORK_SYFT" ] && echo yes || echo no )"
+
+      # IMPORTANT: never fail this step because PATH isn't updated yet
+      echo "== Effective syft (safe checks) =="
+      ls -lah "$SYS_SYFT" 2>/dev/null || true
+      ls -lah "$WORK_SYFT" 2>/dev/null || true
+      command -v syft || true
+    displayName: "Install/Verify Syft"
+
+  - script: |
+      set -euo pipefail
+
+      WORK_BIN_DIR="$(Pipeline.Workspace)/bin"
+      WORK_SYFT="$WORK_BIN_DIR/syft"
+      SYS_SYFT="/usr/local/bin/syft"
+
+      # Choose syft binary deterministically (no PATH dependence)
+      if [ -x "$SYS_SYFT" ]; then
+        SYFT_BIN="$SYS_SYFT"
+      elif [ -x "$WORK_SYFT" ]; then
+        SYFT_BIN="$WORK_SYFT"
+      elif command -v syft >/dev/null 2>&1; then
+        SYFT_BIN="$(command -v syft)"
+      else
+        echo "ERROR: syft not found anywhere."
+        echo "Checked: $SYS_SYFT, $WORK_SYFT, PATH"
+        exit 1
+      fi
+
+      # Resolve source path relative to repo root
+      SRC_REL="${{ parameters.sourcePath }}"
+      SRC_ABS="$(Build.SourcesDirectory)/$SRC_REL"
+      FORMATS="${{ parameters.outputFormats }}"
+
+      echo "== Source SBOM mode =="
+      echo "Source (relative): $SRC_REL"
+      echo "Source (absolute): $SRC_ABS"
+      echo "Formats: $FORMATS"
+      echo "Using syft: $SYFT_BIN"
+      "$SYFT_BIN" version || true
+
+      if [ ! -d "$SRC_ABS" ]; then
+        echo "ERROR: sourcePath '$SRC_REL' not found at '$SRC_ABS'"
+        echo "Repo root contents:"
+        ls -lah "$(Build.SourcesDirectory)"
+        exit 1
+      fi
+
+      # Write SBOM to Pipeline.Workspace for stability
+      OUT_DIR="$(Pipeline.Workspace)/sbom"
+      mkdir -p "$OUT_DIR"
+
+      TARGET="dir:$SRC_ABS"
+      echo "Generating SBOM for: $TARGET"
+
+      for fmt in $FORMATS; do
+        OUT="$OUT_DIR/sbom.${fmt}.json"
+        echo "-> $SYFT_BIN $TARGET -o $fmt > $OUT"
+        "$SYFT_BIN" "$TARGET" -o "$fmt" > "$OUT"
+      done
+
+      echo "SBOM outputs:"
+      ls -lah "$OUT_DIR"
+    displayName: "Generate SBOM(s) from SOURCE with Syft"
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish SBOM Artifact"
+    condition: always()
+    inputs:
+      targetPath: "$(Pipeline.Workspace)/sbom"
+      artifact: "${{ parameters.artifactName }}"
+      publishLocation: "pipeline"
+
+  - script: |
+      set -euo pipefail
+      echo "Post-publish flush (keep job alive briefly so ADO logs finalize)"
+      sleep 3
+    displayName: "Post-publish flush"
+    condition: always()

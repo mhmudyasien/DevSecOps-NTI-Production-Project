@@ -1,0 +1,94 @@
+parameters:
+  - name: imageName
+    type: string
+
+  - name: imageTag
+    type: string
+    default: "$(Build.BuildNumber)"
+
+  - name: ecrRegistry
+    type: string
+
+  - name: pushLatest
+    type: boolean
+    default: true
+
+  # Additional tags as a single space-separated string (YAML-safe)
+  # Example: "sha-1234 build-42"
+  - name: additionalTags
+    type: string
+    default: ""
+
+  - name: enableImageScanning
+    type: boolean
+    default: true
+
+steps:
+  - script: |
+      set -euo pipefail
+
+      : "${AWS_REGION:?AWS_REGION is required}"
+      : "${AWS_ACCOUNT_ID:?AWS_ACCOUNT_ID is required}"
+
+      REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      echo "Logging in to ECR: $REGISTRY"
+
+      aws ecr get-login-password --region "${AWS_REGION}" \
+        | docker login --username AWS --password-stdin "${REGISTRY}"
+
+      echo "ECR login OK"
+    displayName: "Login to ECR"
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+      AWS_REGION: $(AWS_REGION)
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
+
+  - script: |
+      set -euo pipefail
+
+      IMAGE_LOCAL="${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      ECR_REPO="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}"
+      ECR_TAG="${{ parameters.imageTag }}"
+
+      echo "Local image: $IMAGE_LOCAL"
+      echo "ECR repo:     $ECR_REPO"
+      echo "Tag:          $ECR_TAG"
+
+      # Ensure ECR repository exists (idempotent)
+      if ! aws ecr describe-repositories --repository-names "${{ parameters.imageName }}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+        echo "ECR repo does not exist. Creating: ${{ parameters.imageName }}"
+        aws ecr create-repository --repository-name "${{ parameters.imageName }}" --image-scanning-configuration scanOnPush=${{ parameters.enableImageScanning }} --region "${AWS_REGION}" >/dev/null
+      else
+        echo "ECR repo exists: ${{ parameters.imageName }}"
+      fi
+
+      # Tag & push main tag
+      docker tag "$IMAGE_LOCAL" "${ECR_REPO}:${ECR_TAG}"
+      docker push "${ECR_REPO}:${ECR_TAG}"
+
+      # Optionally tag & push latest
+      if [ "${{ parameters.pushLatest }}" = "true" ] || [ "${{ parameters.pushLatest }}" = "True" ]; then
+        docker tag "$IMAGE_LOCAL" "${ECR_REPO}:latest"
+        docker push "${ECR_REPO}:latest"
+      fi
+
+      # Additional tags (space-separated)
+      EXTRA_TAGS="${{ parameters.additionalTags }}"
+      if [ -n "$EXTRA_TAGS" ]; then
+        echo "Pushing additional tags: $EXTRA_TAGS"
+        for t in $EXTRA_TAGS; do
+          docker tag "$IMAGE_LOCAL" "${ECR_REPO}:${t}"
+          docker push "${ECR_REPO}:${t}"
+        done
+      else
+        echo "No additional tags"
+      fi
+
+      echo "Push complete: ${ECR_REPO}:${ECR_TAG}"
+    displayName: "Tag & Push Image to ECR"
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+      AWS_REGION: $(AWS_REGION)
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)

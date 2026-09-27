@@ -1,0 +1,142 @@
+parameters:
+  - name: imageName
+    type: string
+
+  - name: imageTag
+    type: string
+    default: "$(Build.BuildNumber)"
+
+  - name: severityThreshold
+    type: string
+    default: "CRITICAL,HIGH"
+
+  - name: failOnVulnerabilities
+    type: boolean
+    default: true
+
+  - name: ignoreUnfixed
+    type: boolean
+    default: false
+
+  # Optional: path to a Trivy config file in repo (trivy.yaml)
+  - name: trivyConfigPath
+    type: string
+    default: ""
+
+steps:
+  - script: |
+      set -euo pipefail
+
+      echo "TRIVY_TEMPLATE_VERSION=20260212_BIN_v1"
+
+      # Ensure basic tools exist (no installing here)
+      for cmd in docker aws; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+          echo "ERROR: required tool missing: $cmd"
+          exit 1
+        fi
+      done
+
+      if ! command -v curl >/dev/null 2>&1; then
+        echo "ERROR: curl is required to install Trivy without sudo. Install curl on the agent host."
+        exit 1
+      fi
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      mkdir -p "$BIN_DIR"
+      echo "##vso[task.prependpath]$BIN_DIR"
+
+      TRIVY_BIN="$BIN_DIR/trivy"
+
+      # Install trivy if missing
+      if [ -x "$TRIVY_BIN" ]; then
+        echo "Trivy already present at: $TRIVY_BIN"
+      elif command -v trivy >/dev/null 2>&1; then
+        echo "Trivy already installed in PATH: $(command -v trivy)"
+        # Copy into BIN_DIR so later steps are consistent (optional)
+        cp "$(command -v trivy)" "$TRIVY_BIN" || true
+      else
+        echo "Trivy not found. Installing to $TRIVY_BIN (no sudo)..."
+        # Pin version for stability
+        VER="0.57.1"
+        URL="https://github.com/aquasecurity/trivy/releases/download/v${VER}/trivy_${VER}_Linux-64bit.tar.gz"
+
+        curl -sSfL "$URL" -o /tmp/trivy.tgz
+        tar -xzf /tmp/trivy.tgz -C "$BIN_DIR" trivy
+        chmod +x "$TRIVY_BIN"
+      fi
+
+      "$TRIVY_BIN" --version
+    displayName: "Install/Verify Trivy (no sudo)"
+
+  - script: |
+      set -euo pipefail
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      TRIVY_BIN="$BIN_DIR/trivy"
+
+      if [ ! -x "$TRIVY_BIN" ] && command -v trivy >/dev/null 2>&1; then
+        TRIVY_BIN="$(command -v trivy)"
+      fi
+
+      if [ ! -x "$TRIVY_BIN" ]; then
+        echo "ERROR: trivy not found"
+        exit 1
+      fi
+
+      IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      SEVERITY="${{ parameters.severityThreshold }}"
+      IGNORE_UNFIXED="${{ parameters.ignoreUnfixed }}"
+      FAIL="${{ parameters.failOnVulnerabilities }}"
+      CONFIG_PATH="${{ parameters.trivyConfigPath }}"
+
+      echo "Scanning: $IMAGE"
+      echo "Severity: $SEVERITY"
+      echo "ignoreUnfixed: $IGNORE_UNFIXED"
+      echo "failOnVulnerabilities: $FAIL"
+
+      # Cache dir to speed up runs (DB downloads)
+      CACHE_DIR="$(Pipeline.Workspace)/.trivycache"
+      mkdir -p "$CACHE_DIR"
+      echo "Trivy cache: $CACHE_DIR"
+
+      # If image is in ECR, login first (only needed for remote pulls)
+      if echo "$IMAGE" | grep -q "amazonaws.com/"; then
+        : "${AWS_REGION:?AWS_REGION is required}"
+        : "${AWS_ACCOUNT_ID:?AWS_ACCOUNT_ID is required}"
+
+        REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        echo "Logging in to ECR: $REGISTRY"
+        aws ecr get-login-password --region "$AWS_REGION" \
+          | docker login --username AWS --password-stdin "$REGISTRY"
+      fi
+
+      FLAGS=(--cache-dir "$CACHE_DIR" --severity "$SEVERITY" --format table)
+
+      if [ "$IGNORE_UNFIXED" = "true" ] || [ "$IGNORE_UNFIXED" = "True" ]; then
+        FLAGS+=(--ignore-unfixed)
+      fi
+
+      # Optional Trivy config file
+      if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
+        echo "Using Trivy config: $CONFIG_PATH"
+        FLAGS+=(--config "$CONFIG_PATH")
+      fi
+
+      # If you only want vulnerability scanning (faster), keep this:
+      FLAGS+=(--security-checks vuln)
+
+      echo "Running: $TRIVY_BIN image ${FLAGS[*]} $IMAGE"
+
+      if [ "$FAIL" = "true" ] || [ "$FAIL" = "True" ]; then
+        # exit-code 1 when findings match severity
+        "$TRIVY_BIN" image "${FLAGS[@]}" --exit-code 1 "$IMAGE"
+      else
+        "$TRIVY_BIN" image "${FLAGS[@]}" --exit-code 0 "$IMAGE" || true
+      fi
+    displayName: "Trivy Image Scan"
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+      AWS_REGION: $(AWS_REGION)
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)

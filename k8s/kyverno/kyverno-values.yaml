@@ -1,0 +1,74 @@
+# kyverno-values.yaml
+# Usage:
+# helm upgrade --install kyverno kyverno/kyverno -n kyverno --create-namespace -f kyverno-values.yaml --wait --timeout 15m
+
+# Enable policy reports (Audit/reporting)
+policyReports:
+  enabled: true
+
+# Controllers replicas + resources
+
+admissionController:
+  replicas: 3
+  resources:
+    limits:
+      memory: 512Mi
+      cpu: 500m
+    requests:
+      memory: 256Mi
+      cpu: 100m
+
+backgroundController:
+  enabled: true
+  replicas: 2
+  resources:
+    limits:
+      memory: 512Mi
+      cpu: 500m
+    requests:
+      memory: 256Mi
+      cpu: 100m
+
+cleanupController:
+  enabled: true
+  replicas: 2
+  resources:
+    limits:
+      memory: 512Mi
+      cpu: 500m
+    requests:
+      memory: 256Mi
+      cpu: 100m
+
+reportsController:
+  enabled: true
+  replicas: 2
+  resources:
+    limits:
+      memory: 512Mi
+      cpu: 500m
+    requests:
+      memory: 256Mi
+      cpu: 100m
+
+# Metrics (for Prometheus scraping)
+metricsService:
+  enabled: true
+
+# Webhook cleanup job
+webhooksCleanup:
+  enabled: true
+
+# Pod-level security context (applies to kyverno pods themselves)
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context (applies to kyverno containers)
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL

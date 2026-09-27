@@ -1,0 +1,287 @@
+parameters:
+  - name: imageName
+    type: string
+
+  - name: imageTag
+    type: string
+    default: "$(Build.BuildNumber)"
+
+  # NEW: Image digest (sha256:....). If provided, we'll sign/verify using @digest
+  - name: imageDigest
+    type: string
+    default: ""
+
+  - name: ecrRegistry
+    type: string
+    default: "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
+
+  - name: signingMethod
+    type: string
+    default: "keyless" # 'keyless' or 'keypair'
+
+  # For keypair mode: pass BASE64 of cosign.key (single-line)
+  - name: cosignKey
+    type: string
+    default: "" # Only needed for keypair method (expected base64)
+
+  - name: rekorUrl
+    type: string
+    default: "https://rekor.sigstore.dev"
+
+  # keep issuer configurable (used only for keyless)
+  - name: oidcIssuer
+    type: string
+    default: "https://vstoken.dev.azure.com/selcon"
+
+steps:
+  # 0) Prereqs: VERIFY ONLY (no sudo installs)
+  - script: |
+      set -euo pipefail
+
+      echo "COSIGN_TEMPLATE_VERSION=20260212_v3"
+      echo "== OS info =="
+      cat /etc/os-release || true
+
+      have() { command -v "$1" >/dev/null 2>&1; }
+
+      echo "== Checking required tools (no sudo) =="
+      missing=0
+      for cmd in aws docker curl wget base64; do
+        if have "$cmd"; then
+          echo "OK: $cmd -> $(command -v "$cmd")"
+        else
+          echo "MISSING: $cmd"
+          missing=1
+        fi
+      done
+
+      if [ "$missing" -ne 0 ]; then
+        echo ""
+        echo "ERROR: Missing required tools on this self-hosted agent."
+        echo "Install ONCE on the agent host: awscli, docker, curl or wget, coreutils (base64)."
+        exit 1
+      fi
+
+      echo ""
+      echo "== Docker daemon check =="
+      docker version || true
+      if ! docker info >/dev/null 2>&1; then
+        echo "ERROR: Docker daemon not reachable."
+        echo "Ensure docker is running and this user is in docker group."
+        exit 1
+      fi
+
+      echo ""
+      echo "== aws cli version =="
+      aws --version
+    displayName: "Prereqs (no sudo): verify docker + aws + curl/wget + base64"
+    env:
+      AWS_REGION: $(AWS_REGION)
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
+
+  # 1) Install/Verify cosign (no sudo; install into workspace)
+  - script: |
+      set -euo pipefail
+
+      echo "##[section]Install/Verify Cosign"
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      mkdir -p "$BIN_DIR"
+      echo "##vso[task.prependpath]$BIN_DIR"
+
+      COSIGN_BIN="$BIN_DIR/cosign"
+
+      if command -v cosign >/dev/null 2>&1; then
+        echo "Cosign already in PATH: $(command -v cosign)"
+        cosign version
+        exit 0
+      fi
+
+      if [ -x "$COSIGN_BIN" ]; then
+        echo "Cosign already present at: $COSIGN_BIN"
+        "$COSIGN_BIN" version
+        exit 0
+      fi
+
+      COSIGN_VERSION="v2.2.2"
+      URL="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+
+      echo "Downloading cosign ${COSIGN_VERSION}..."
+      if command -v curl >/dev/null 2>&1; then
+        curl -sSfL "$URL" -o "$COSIGN_BIN"
+      else
+        wget -qO "$COSIGN_BIN" "$URL"
+      fi
+      chmod +x "$COSIGN_BIN"
+      "$COSIGN_BIN" version
+    displayName: "Install/Verify Cosign (no sudo)"
+
+  # 2) Login to ECR
+  - script: |
+      set -euo pipefail
+
+      : "${AWS_REGION:?AWS_REGION is required}"
+      : "${AWS_ACCOUNT_ID:?AWS_ACCOUNT_ID is required}"
+
+      REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      echo "Logging in to ECR: $REGISTRY"
+
+      aws ecr get-login-password --region "${AWS_REGION}" \
+        | docker login --username AWS --password-stdin "${REGISTRY}"
+
+      echo "ECR login OK"
+    displayName: "Login to ECR (aws ecr get-login-password)"
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+      AWS_REGION: $(AWS_REGION)
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
+
+  # 3) Sign
+  - script: |
+      set -euo pipefail
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      COSIGN_BIN="$BIN_DIR/cosign"
+      if [ ! -x "$COSIGN_BIN" ] && command -v cosign >/dev/null 2>&1; then
+        COSIGN_BIN="$(command -v cosign)"
+      fi
+      if [ ! -x "$COSIGN_BIN" ]; then
+        echo "ERROR: cosign not found"
+        exit 1
+      fi
+
+      # Use digest if provided; else fall back to :tag
+      if [ -n "${{ parameters.imageDigest }}" ]; then
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}@${{ parameters.imageDigest }}"
+      else
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      fi
+
+      ISSUER="${{ parameters.oidcIssuer }}"
+
+      echo "##[section]Signing image: $IMAGE_URI"
+      echo "Signing method: ${{ parameters.signingMethod }}"
+      echo "Digest provided? $([ -n '${{ parameters.imageDigest }}' ] && echo yes || echo no)"
+
+      if [ "${{ parameters.signingMethod }}" = "keyless" ]; then
+        echo "OIDC issuer: $ISSUER"
+        export COSIGN_EXPERIMENTAL=1
+
+        "$COSIGN_BIN" sign \
+          --yes \
+          --oidc-issuer "$ISSUER" \
+          --rekor-url "${{ parameters.rekorUrl }}" \
+          "$IMAGE_URI"
+
+        echo "##[section]Image signed successfully (keyless)"
+
+      elif [ "${{ parameters.signingMethod }}" = "keypair" ]; then
+        if [ -z "${{ parameters.cosignKey }}" ]; then
+          echo "##vso[task.logissue type=error]Cosign key not provided for keypair method"
+          echo "Expected: base64-encoded cosign.key in parameters.cosignKey"
+          exit 1
+        fi
+
+        KEY_FILE="$(Pipeline.Workspace)/cosign.key"
+
+        # Decode base64 secret into real PEM file (avoids newline/PEM corruption)
+        printf "%s" "${{ parameters.cosignKey }}" | base64 -d > "$KEY_FILE"
+
+        # Basic validation without exposing key
+        if ! head -n 1 "$KEY_FILE" | grep -q "BEGIN"; then
+          echo "##vso[task.logissue type=error]Decoded key does not look like a valid PEM file (missing BEGIN header)"
+          rm -f "$KEY_FILE" || true
+          exit 1
+        fi
+
+        export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
+
+        "$COSIGN_BIN" sign \
+          --yes \
+          --key "$KEY_FILE" \
+          --rekor-url "${{ parameters.rekorUrl }}" \
+          "$IMAGE_URI"
+
+        rm -f "$KEY_FILE"
+
+        echo "##[section]Image signed successfully (keypair)"
+      else
+        echo "##vso[task.logissue type=error]Invalid signing method: ${{ parameters.signingMethod }}"
+        exit 1
+      fi
+    displayName: "Sign Image with Cosign"
+    env:
+      COSIGN_EXPERIMENTAL: 1
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      COSIGN_PASSWORD: $(COSIGN_PASSWORD)
+
+  # 4) Verify
+  - script: |
+      set -euo pipefail
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      COSIGN_BIN="$BIN_DIR/cosign"
+      if [ ! -x "$COSIGN_BIN" ] && command -v cosign >/dev/null 2>&1; then
+        COSIGN_BIN="$(command -v cosign)"
+      fi
+      if [ ! -x "$COSIGN_BIN" ]; then
+        echo "ERROR: cosign not found"
+        exit 1
+      fi
+
+      # Use digest if provided; else fall back to :tag
+      if [ -n "${{ parameters.imageDigest }}" ]; then
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}@${{ parameters.imageDigest }}"
+      else
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      fi
+
+      ISSUER="${{ parameters.oidcIssuer }}"
+
+      echo "##[section]Verifying signature: $IMAGE_URI"
+
+      if [ "${{ parameters.signingMethod }}" = "keyless" ]; then
+        echo "OIDC issuer: $ISSUER"
+        export COSIGN_EXPERIMENTAL=1
+
+        "$COSIGN_BIN" verify \
+          --certificate-oidc-issuer "$ISSUER" \
+          --rekor-url "${{ parameters.rekorUrl }}" \
+          "$IMAGE_URI"
+
+      elif [ "${{ parameters.signingMethod }}" = "keypair" ]; then
+        echo "Keypair verification requires the public key (cosign.pub)."
+        echo "Recommended: commit cosign.pub to repo and add: cosign verify --key cosign.pub $IMAGE_URI"
+      fi
+
+      echo "##[section]Verify step completed"
+    displayName: "Verify Signature"
+    env:
+      COSIGN_EXPERIMENTAL: 1
+    condition: succeeded()
+
+  # 5) Tree
+  - script: |
+      set -euo pipefail
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      COSIGN_BIN="$BIN_DIR/cosign"
+      if [ ! -x "$COSIGN_BIN" ] && command -v cosign >/dev/null 2>&1; then
+        COSIGN_BIN="$(command -v cosign)"
+      fi
+      if [ ! -x "$COSIGN_BIN" ]; then
+        echo "ERROR: cosign not found"
+        exit 1
+      fi
+
+      # Use digest if provided; else fall back to :tag
+      if [ -n "${{ parameters.imageDigest }}" ]; then
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}@${{ parameters.imageDigest }}"
+      else
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      fi
+
+      "$COSIGN_BIN" tree "$IMAGE_URI" || true
+    displayName: "Display Signature Tree"
+    condition: succeeded()

@@ -1,0 +1,54 @@
+parameters:
+  - name: environment
+    type: string
+
+  - name: namespace
+    type: string
+
+  - name: manifestsPath
+    type: string
+
+  - name: clusterName
+    type: string
+
+steps:
+  - script: |
+      set -euo pipefail
+
+      echo "Ensuring aws CLI exists..."
+      if ! command -v aws >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo apt-get install -y awscli
+      fi
+
+      aws --version
+
+      echo "Ensuring kubectl exists..."
+      if ! command -v kubectl >/dev/null 2>&1; then
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+      fi
+
+      kubectl version --client
+    displayName: "Install/Verify aws + kubectl"
+
+  - script: |
+      set -euo pipefail
+
+      echo "Updating kubeconfig for EKS cluster: ${{ parameters.clusterName }}"
+
+      aws eks update-kubeconfig \
+        --region "$AWS_REGION" \
+        --name "${{ parameters.clusterName }}"
+
+      echo "Deploying manifests from: ${{ parameters.manifestsPath }}"
+
+      kubectl apply -n "${{ parameters.namespace }}" -f "${{ parameters.manifestsPath }}"
+
+      echo "Deployment completed."
+    displayName: "Deploy to EKS"
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+      AWS_REGION: $(AWS_REGION)

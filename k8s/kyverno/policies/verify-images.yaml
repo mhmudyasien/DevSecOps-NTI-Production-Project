@@ -1,0 +1,50 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-ecr-signed-images
+  annotations:
+    policies.kyverno.io/title: Verify ECR Image Signatures
+    policies.kyverno.io/category: Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Verifies that all container images from ECR are signed with Cosign.
+      This ensures only trusted, signed images are deployed to the cluster.
+spec:
+  validationFailureAction: Audit
+  background: false
+  webhookTimeoutSeconds: 30
+
+  # In Audit mode, keep this non-blocking.
+  # If Sigstore/Rekor has issues, pods should still be admitted.
+  failurePolicy: Ignore
+
+  rules:
+    - name: verify-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - prod
+                - staging
+                - dev
+
+      verifyImages:
+        - imageReferences:
+            - "*.dkr.ecr.us-east-2.amazonaws.com/*:*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://vstoken.dev.azure.com/selcon"
+                    subject: "repo:DevSecOps-Selcon/DevSecOps-NTI-Production-Project:*"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+                      ignoreTlog: false
+
+          # لازم false مع Audit
+          mutateDigest: false
+          verifyDigest: true
+          required: true
